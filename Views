@@ -1,0 +1,126 @@
+-- ======================================================================
+-- ANALYTIC VIEWS FOR REPORTS
+-- ======================================================================
+
+PRINT ' ';
+PRINT 'Creating analytics views...';
+
+-- View 1: Active agents performance
+IF OBJECT_ID('v_active_agents_performance', 'V') IS NOT NULL DROP VIEW v_active_agents_performance;
+GO
+CREATE VIEW v_active_agents_performance AS
+SELECT 
+    e.employeeID,
+    e.employeeName,
+    e.line,
+    COUNT(c.callID) AS total_atenciones,
+    ROUND(AVG(c.waitTime), 2) AS tiempo_espera_promedio,
+    ROUND(AVG(CASE WHEN c.isSolved = 1 THEN 100.0 ELSE 0 END), 2) AS resolucion_porcentaje,
+    ROUND(AVG(CAST(f.csat_score AS DECIMAL(3,2))), 2) AS csat_promedio,
+    RANK() OVER (ORDER BY AVG(CAST(f.csat_score AS DECIMAL(3,2))) DESC) AS ranking_csat
+FROM dim_employee e
+LEFT JOIN fact_calltime c ON e.employeeID = c.employeeID
+LEFT JOIN fact_csat f ON e.employeeID = f.employeeID
+WHERE e.activeFlag = 1
+GROUP BY e.employeeID, e.employeeName, e.line;
+GO
+
+-- View 2: Monthly turnover rate
+IF OBJECT_ID('v_monthly_turnover', 'V') IS NOT NULL DROP VIEW v_monthly_turnover;
+GO
+CREATE VIEW v_monthly_turnover AS
+SELECT 
+    YEAR(exitDate) AS año,
+    MONTH(exitDate) AS mes,
+    COUNT(*) AS bajas_mes,
+    (SELECT COUNT(*) FROM dim_employee WHERE hireDate <= DATEFROMPARTS(YEAR(exitDate), MONTH(exitDate), 1)) AS total_empleados_inicio_mes,
+    ROUND((COUNT(*) * 100.0) / NULLIF((SELECT COUNT(*) FROM dim_employee WHERE hireDate <= DATEFROMPARTS(YEAR(exitDate), MONTH(exitDate), 1)), 0), 2) AS tasa_rotacion_porcentaje
+FROM dim_employee
+WHERE exitDate IS NOT NULL
+GROUP BY YEAR(exitDate), MONTH(exitDate);
+GO
+
+-- View 3: SLA by business line
+IF OBJECT_ID('v_sla_by_line', 'V') IS NOT NULL DROP VIEW v_sla_by_line;
+GO
+CREATE VIEW v_sla_by_line AS
+SELECT 
+    line,
+    COUNT(*) AS total_llamadas,
+    ROUND(AVG(waitTime), 2) AS avg_wait_sec,
+    ROUND(AVG(inboundTime), 2) AS avg_talk_sec,
+    ROUND(MAX(waitTime), 2) AS max_wait_sec,
+    SUM(CASE WHEN isSolved = 0 THEN 1 ELSE 0 END) AS escalations,
+    ROUND((SUM(CASE WHEN isSolved = 1 THEN 100.0 ELSE 0 END) / COUNT(*)), 2) AS resolution_rate
+FROM fact_calltime
+GROUP BY line;
+GO
+
+-- View 4: Daily trends (for Power BI)
+IF OBJECT_ID('v_daily_trends', 'V') IS NOT NULL DROP VIEW v_daily_trends;
+GO
+CREATE VIEW v_daily_trends AS
+SELECT 
+    metricDate,
+    SUM(totalCalls) AS llamadas_diarias,
+    ROUND(AVG(avgWaitTime), 2) AS wait_time_promedio_dia,
+    ROUND(AVG(resolutionRate), 2) AS resolucion_promedio_dia,
+    ROUND(AVG(avgCSAT), 2) AS csat_promedio_dia
+FROM agg_daily_productivity
+GROUP BY metricDate;
+GO
+
+PRINT 'Created Views:';
+PRINT '   - v_active_agents_performance';
+PRINT '   - v_monthly_turnover';
+PRINT '   - v_sla_by_line';
+PRINT '   - v_daily_trends';
+
+-- ======================================================================
+-- SECTION 4: VALIDATION QUERIES (TO VERIFY DATA QUALITY)
+-- ======================================================================
+
+PRINT ' ';
+PRINT 'VALIDATION QUERIES  :';
+PRINT '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
+
+-- Validation: Conteo de registros por tabla
+PRINT 'TOTAL RECORDS BY TABLE:';
+SELECT 'dim_employee' AS tabla, COUNT(*) AS registry FROM dim_employee
+UNION ALL
+SELECT 'fact_csat', COUNT(*) FROM fact_csat
+UNION ALL
+SELECT 'fact_calltime', COUNT(*) FROM fact_calltime
+UNION ALL
+SELECT 'agg_daily_productivity', COUNT(*) FROM agg_daily_productivity;
+
+-- Validation: Top 5 agents
+PRINT ' ';
+PRINT 'TOP 5 AGENTS WITH BEST CSAT (ACTIVOS):';
+SELECT TOP 5 employeeName, line, total_atenciones, csat_promedio, resolucion_porcentaje
+FROM v_active_agents_performance
+WHERE csat_promedio IS NOT NULL
+ORDER BY csat_promedio DESC;
+
+-- Validation: turnover
+PRINT ' ';
+PRINT 'MONTHLY TURNOVER RATE:';
+SELECT * FROM v_monthly_turnover;
+
+-- Validation: SLA by bussiness line
+PRINT ' ';
+PRINT 'SLA BY BL:';
+SELECT * FROM v_sla_by_line;
+
+-- Validation: Daily trends
+PRINT ' ';
+PRINT 'DAILY TRENDS (Last 30 days):';
+SELECT TOP 10 * 
+FROM v_daily_trends 
+ORDER BY metricDate DESC;
+
+PRINT ' ';
+PRINT '===============================================';
+PRINT 'EXECUTED SUCCESFULLY';
+PRINT 'DB ready to connect with PBI';
+PRINT '=================================================';
