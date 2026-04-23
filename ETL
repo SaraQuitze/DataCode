@@ -1,0 +1,258 @@
+/* ======================================================================
+   PREREQUISITES:
+   1. Run as administration:
+      EXEC sp_configure 'show advanced options', 1;
+      RECONFIGURE;
+      EXEC sp_configure 'Ad Hoc Distributed Queries', 1;
+      RECONFIGURE;
+   
+   2. Install the driver:
+      Microsoft Access Database Engine 2016 Redistributable
+   
+   3. CSV files path C:\DataAnalytics\CallCenter\data\
+   ====================================================================== */
+
+-- ======================================================================
+-- Initial config (execute just once)
+-- ======================================================================
+
+-- Enable Ad Hoc Distributed Queries (if not enabled)
+IF (SELECT value_in_use FROM sys.configurations WHERE name = 'Ad Hoc Distributed Queries') = 0
+BEGIN
+    EXEC sp_configure 'show advanced options', 1;
+    RECONFIGURE;
+    EXEC sp_configure 'Ad Hoc Distributed Queries', 1;
+    RECONFIGURE;
+    PRINT 'Consultas ad hoc distribuidas habilitadas';
+END
+
+-- ======================================================================
+-- SCHEME CREATION
+-- ======================================================================
+
+-- Erase tables for clean execution
+IF OBJECT_ID('agg_daily_productivity', 'U') IS NOT NULL DROP TABLE agg_daily_productivity;
+IF OBJECT_ID('fact_calltime', 'U') IS NOT NULL DROP TABLE fact_calltime;
+IF OBJECT_ID('fact_csat', 'U') IS NOT NULL DROP TABLE fact_csat;
+IF OBJECT_ID('dim_employee', 'U') IS NOT NULL DROP TABLE dim_employee;
+
+PRINT 'Creating tables...';
+
+-- Dim table employee
+CREATE TABLE dim_employee (
+    employeeID INT PRIMARY KEY,
+    employeeName VARCHAR(100),
+    managerID INT,
+    line VARCHAR(50),           
+    hireDate DATE,              
+    exitDate DATE,              
+    activeFlag BIT DEFAULT 1,
+    lastUpdated DATETIME DEFAULT GETDATE()
+);
+
+-- Fact table: CSAT
+CREATE TABLE fact_csat (
+    keyID INT PRIMARY KEY,
+    employeeID INT,
+    csat_score INT CHECK (csat_score BETWEEN 1 AND 5),
+    surveyDate DATE,
+    loadDate DATETIME DEFAULT GETDATE(),
+    FOREIGN KEY (employeeID) REFERENCES dim_employee(employeeID)
+);
+
+-- Fact table: call time
+CREATE TABLE fact_calltime (
+    callID INT PRIMARY KEY,
+    employeeID INT,
+    line VARCHAR(50),
+    inboundTime INT,            
+    outboundTime INT,           
+    waitTime INT,               
+    isSolved BIT,
+    escalatedTo VARCHAR(100),
+    callDate DATE,
+    loadDate DATETIME DEFAULT GETDATE(),
+    FOREIGN KEY (employeeID) REFERENCES dim_employee(employeeID)
+);
+
+-- new table: daily productivity
+CREATE TABLE agg_daily_productivity (
+    metricDate DATE,
+    employeeID INT,
+    totalCalls INT,
+    avgWaitTime DECIMAL(10,2),
+    resolutionRate DECIMAL(5,2),
+    avgCSAT DECIMAL(3,2),
+    lastUpdated DATETIME DEFAULT GETDATE(),
+    PRIMARY KEY (metricDate, employeeID)
+);
+
+PRINT 'tables succesfully created';
+
+-- ======================================================================
+-- Principal ETL (from CSV)
+-- ======================================================================
+
+BEGIN TRANSACTION;
+
+PRINT 'Starting ETL from archivos CSV...';
+PRINT 'From: C:\DataAnalytics\CallCenter\data\';
+
+-- Upload dim_employee from DNA.csv
+PRINT 'Processing dna.csv...';
+
+--Create temp table for audit
+CREATE TABLE #etl_audit (
+    table_name VARCHAR(50),
+    rows_read INT,
+    rows_inserted INT,
+    rows_rejected INT,
+    error_message VARCHAR(500)
+);
+
+--Upload clean data
+INSERT INTO dim_employee (employeeID, employeeName, managerID, line, hireDate, exitDate, activeFlag)
+SELECT 
+    employeeID,
+    TRIM(employeeName) AS employeeName,
+    NULLIF(managerID, '') AS managerID,
+    UPPER(TRIM(line)) AS line,
+    TRY_CONVERT(DATE, hireDate, 23) AS hireDate,
+    TRY_CONVERT(DATE, NULLIF(exitDate, ''), 23) AS exitDate,
+    CASE 
+        WHEN TRY_CONVERT(DATE, NULLIF(exitDate, ''), 23) IS NULL THEN 1
+        WHEN TRY_CONVERT(DATE, NULLIF(exitDate, ''), 23) <= CAST(GETDATE() AS DATE) THEN 0
+        ELSE 1
+    END AS activeFlag
+FROM OPENROWSET(
+    'MSDASQL',
+    'Driver={Microsoft Access Text Driver (*.txt, *.csv)};DBQ=C:\DataAnalytics\CallCenter\data\;',
+    'SELECT * FROM dna.csv'
+) AS csv
+WHERE employeeID IS NOT NULL
+  AND TRIM(employeeName) <> ''
+  AND NOT EXISTS (SELECT 1 FROM dim_employee d WHERE d.employeeID = csv.employeeID);
+
+INSERT INTO #etl_audit VALUES ('dim_employee', @@ROWCOUNT, @@ROWCOUNT, 0, NULL);
+
+PRINT CONCAT('Updated: ', @@ROWCOUNT, ' rows in dim_employee');
+
+--Update changes in DNA info
+UPDATE d
+SET 
+    d.managerID = NULLIF(s.managerID, ''),
+    d.line = UPPER(TRIM(s.line)),
+    d.exitDate = TRY_CONVERT(DATE, NULLIF(s.exitDate, ''), 23),
+    d.activeFlag = CASE 
+        WHEN TRY_CONVERT(DATE, NULLIF(s.exitDate, ''), 23) IS NULL THEN 1
+        WHEN TRY_CONVERT(DATE, NULLIF(s.exitDate, ''), 23) <= CAST(GETDATE() AS DATE) THEN 0
+        ELSE 1
+    END,
+    d.lastUpdated = GETDATE()
+FROM dim_employee d
+INNER JOIN OPENROWSET(
+    'MSDASQL',
+    'Driver={Microsoft Access Text Driver (*.txt, *.csv)};DBQ=C:\DataAnalytics\CallCenter\data\;',
+    'SELECT * FROM dna.csv'
+) AS s ON d.employeeID = s.employeeID
+WHERE 
+    ISNULL(d.managerID, 0) <> ISNULL(NULLIF(s.managerID, ''), 0)
+    OR ISNULL(d.line, '') <> ISNULL(UPPER(TRIM(s.line)), '')
+    OR ISNULL(d.exitDate, '1900-01-01') <> ISNULL(TRY_CONVERT(DATE, NULLIF(s.exitDate, ''), 23), '1900-01-01');
+
+PRINT CONCAT('Updated: ', @@ROWCOUNT, ' rows in dim_employee');
+
+--Upload fact_csat from CSAT.csv
+PRINT 'Processing csat.csv...';
+
+INSERT INTO fact_csat (keyID, employeeID, csat_score, surveyDate)
+SELECT 
+    [Key],
+    employeeID,
+    CASE 
+        WHEN CSAT BETWEEN 1 AND 5 THEN CSAT
+        ELSE NULL
+    END AS csat_score,
+    TRY_CONVERT(DATE, surveyDate, 23) AS surveyDate
+FROM OPENROWSET(
+    'MSDASQL',
+    'Driver={Microsoft Access Text Driver (*.txt, *.csv)};DBQ=C:\DataAnalytics\CallCenter\data\;',
+    'SELECT * FROM csat.csv'
+) AS csv
+INNER JOIN dim_employee e ON csv.employeeID = e.employeeID
+WHERE csv.employeeID IS NOT NULL
+  AND CSAT IS NOT NULL
+  AND CSAT BETWEEN 1 AND 5
+  AND (e.exitDate IS NULL OR TRY_CONVERT(DATE, surveyDate, 23) < e.exitDate)
+  AND NOT EXISTS (
+      SELECT 1 FROM fact_csat f 
+      WHERE f.keyID = csv.[Key]
+  );
+
+INSERT INTO #etl_audit VALUES ('fact_csat', @@ROWCOUNT, @@ROWCOUNT, 0, NULL);
+
+PRINT CONCAT('Inserted: ', @@ROWCOUNT, ' rows in fact_csat');
+
+--Upload fact_calltime from calltime.csv
+PRINT 'Processing calltime.csv...';
+
+INSERT INTO fact_calltime (callID, employeeID, line, inboundTime, outboundTime, waitTime, isSolved, escalatedTo, callDate)
+SELECT
+    [Key],
+    employeeID,
+    UPPER(TRIM(line)),
+    ABS(inboundTime),
+    ABS(outboundTime),
+    ABS(waitTime),
+    ISNULL(isSolved, 0),
+    COALESCE(NULLIF(TRIM(escalatedTo), ''), 'None'),
+    TRY_CONVERT(DATE, callDate, 23)
+FROM OPENROWSET(
+    'MSDASQL',
+    'Driver={Microsoft Access Text Driver (*.txt, *.csv)};DBQ=C:\DataAnalytics\CallCenter\data\;',
+    'SELECT * FROM calltime.csv'
+) AS csv
+INNER JOIN dim_employee e ON csv.employeeID = e.employeeID
+WHERE csv.employeeID IS NOT NULL
+  AND (e.exitDate IS NULL OR TRY_CONVERT(DATE, callDate, 23) < e.exitDate)
+  AND NOT EXISTS (
+      SELECT 1 FROM fact_calltime f 
+      WHERE f.callID = csv.[Key]
+  );
+
+INSERT INTO #etl_audit VALUES ('fact_calltime', @@ROWCOUNT, @@ROWCOUNT, 0, NULL);
+
+PRINT CONCAT('Inserted: ', @@ROWCOUNT, ' rows in fact_calltime');
+
+-- Update table productivity
+PRINT 'Calculando agregados diarios...';
+
+TRUNCATE TABLE agg_daily_productivity;
+
+INSERT INTO agg_daily_productivity (metricDate, employeeID, totalCalls, avgWaitTime, resolutionRate, avgCSAT)
+SELECT
+    CAST(c.callDate AS DATE) AS metricDate,
+    c.employeeID,
+    COUNT(*) AS totalCalls,
+    ROUND(AVG(CAST(c.waitTime AS DECIMAL(10,2))), 2) AS avgWaitTime,
+    ROUND(AVG(CASE WHEN c.isSolved = 1 THEN 100.0 ELSE 0 END), 2) AS resolutionRate,
+    ROUND(AVG(CAST(cs.csat_score AS DECIMAL(3,2))), 2) AS avgCSAT
+FROM fact_calltime c
+LEFT JOIN fact_csat cs ON cs.employeeID = c.employeeID AND cs.surveyDate = CAST(c.callDate AS DATE)
+GROUP BY CAST(c.callDate AS DATE), c.employeeID;
+
+PRINT CONCAT('Inserted: ', @@ROWCOUNT, ' rows in agg_daily_productivity');
+
+-- show audit
+PRINT ' ';
+PRINT 'Upload:';
+SELECT * FROM #etl_audit;
+
+-- clean temp table
+DROP TABLE #etl_audit;
+
+COMMIT TRANSACTION;
+
+PRINT ' ';
+PRINT 'ETL succesfully completed';
+PRINT 'All data is cleaned and uploaded';
