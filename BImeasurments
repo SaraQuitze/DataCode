@@ -1,0 +1,375 @@
+/* ======================================================================
+   DAX MEASURES FOR CALL CENTER ANALYTICS - POWER BI
+   Connect to views: v_active_agents_performance, v_sla_by_line, 
+                     fact_calltime, dim_employee, v_daily_trends
+   ====================================================================== */
+
+// ======================================================================
+// SECTION 1: BASIC MEASURES (CORE KPIs)
+// ======================================================================
+
+// Total calls
+Total Calls = COUNTROWS(fact_calltime)
+
+// Average CSAT (1-5 scale)
+Avg CSAT = AVERAGE(fact_csat[csat_score])
+
+// Resolution rate (percentage)
+Resolution Rate = 
+DIVIDE(
+    CALCULATE(COUNTROWS(fact_calltime), fact_calltime[isSolved] = 1),
+    COUNTROWS(fact_calltime)
+)
+
+// Average wait time (seconds)
+Avg Wait Time (sec) = AVERAGE(fact_calltime[waitTime])
+
+// Average talk time (seconds)
+Avg Talk Time (sec) = AVERAGE(fact_calltime[inboundTime])
+
+// Average after-call work time (seconds)
+Avg After Call Work (sec) = AVERAGE(fact_calltime[outboundTime])
+
+// Total escalations
+Total Escalations = COUNTROWS(FILTER(fact_calltime, fact_calltime[isSolved] = 0))
+
+// Escalation rate
+Escalation Rate = 
+DIVIDE(
+    [Total Escalations],
+    [Total Calls]
+)
+
+
+// ======================================================================
+// SECTION 2: ACTIVE EMPLOYEES MEASURES
+// ======================================================================
+
+// Active employees count
+Active Employees = 
+CALCULATE(
+    COUNTROWS(dim_employee),
+    dim_employee[activeFlag] = 1
+)
+
+// Average CSAT - Active employees only
+Avg CSAT (Active Only) = 
+CALCULATE(
+    AVERAGE(fact_csat[csat_score]),
+    dim_employee[activeFlag] = 1
+)
+
+// Resolution rate - Active employees only
+Resolution Rate (Active Only) = 
+CALCULATE(
+    [Resolution Rate],
+    dim_employee[activeFlag] = 1
+)
+
+// Productivity per active agent (avg calls per day)
+Calls per Active Agent per Day = 
+DIVIDE(
+    [Total Calls],
+    [Active Employees],
+    BLANK()
+)
+
+
+// ======================================================================
+// SECTION 3: TURNOVER & HR METRICS
+// ======================================================================
+
+// Monthly turnover rate (percentage)
+Monthly Turnover Rate = 
+VAR CurrentMonth = SELECTEDVALUE('Calendar'[Date])
+VAR EmployeesStartOfMonth = 
+    CALCULATE(
+        COUNTROWS(dim_employee),
+        dim_employee[hireDate] <= CurrentMonth
+    )
+VAR EmployeesExitedThisMonth = 
+    CALCULATE(
+        COUNTROWS(dim_employee),
+        dim_employee[exitDate] >= CurrentMonth,
+        dim_employee[exitDate] <= EOMONTH(CurrentMonth, 0)
+    )
+RETURN
+    DIVIDE(EmployeesExitedThisMonth, EmployeesStartOfMonth)
+
+// Average tenure of active employees (months)
+Avg Tenure (Months) = 
+AVERAGEX(
+    FILTER(dim_employee, dim_employee[activeFlag] = 1),
+    DATEDIFF(dim_employee[hireDate], COALESCE(dim_employee[exitDate], TODAY()), MONTH)
+)
+
+// Average tenure of active employees (days)
+Avg Tenure (Days) = 
+AVERAGEX(
+    FILTER(dim_employee, dim_employee[activeFlag] = 1),
+    DATEDIFF(dim_employee[hireDate], COALESCE(dim_employee[exitDate], TODAY()), DAY)
+)
+
+// Total employees who left (filtered by date)
+Total Departures = 
+CALCULATE(
+    COUNTROWS(dim_employee),
+    NOT(ISBLANK(dim_employee[exitDate]))
+)
+
+// Year-to-date turnover
+YTD Turnover = 
+TOTALYTD(
+    [Monthly Turnover Rate],
+    'Calendar'[Date]
+)
+
+
+// ======================================================================
+// SECTION 4: RANKING & PERFORMANCE
+// ======================================================================
+
+// Agent ranking by resolution rate
+Agent Rank by Resolution = 
+RANKX(
+    ALL(dim_employee[employeeName]),
+    [Resolution Rate],
+    ,
+    DESC,
+    Dense
+)
+
+// Agent ranking by CSAT
+Agent Rank by CSAT = 
+RANKX(
+    ALL(dim_employee[employeeName]),
+    [Avg CSAT],
+    ,
+    DESC,
+    Dense
+)
+
+// Agent ranking by total calls handled
+Agent Rank by Volume = 
+RANKX(
+    ALL(dim_employee[employeeName]),
+    [Total Calls],
+    ,
+    DESC,
+    Dense
+)
+
+// Top 5 agents by CSAT (dynamic measure)
+Top 5 Agents by CSAT = 
+TOPN(5, ALL(dim_employee[employeeName]), [Avg CSAT], DESC)
+
+
+// ======================================================================
+// SECTION 5: TIME INTELLIGENCE (TRENDS)
+// ======================================================================
+
+// Calls last 30 days
+Calls Last 30 Days = 
+CALCULATE(
+    [Total Calls],
+    fact_calltime[callDate] >= TODAY() - 30
+)
+
+// CSAT trend (last 3 months)
+CSAT 3-Month Trend = 
+CALCULATE(
+    [Avg CSAT],
+    DATESINPERIOD('Calendar'[Date], LASTDATE('Calendar'[Date]), -3, MONTH)
+)
+
+// Month-over-month resolution rate change
+MoM Resolution Rate Change = 
+[Resolution Rate] - 
+CALCULATE(
+    [Resolution Rate],
+    PREVIOUSMONTH('Calendar'[Date])
+)
+
+// Week-over-week call volume change
+WoW Call Volume Change = 
+[Total Calls] - 
+CALCULATE(
+    [Total Calls],
+    DATEADD('Calendar'[Date], -7, DAY)
+)
+
+// Moving average of CSAT (last 7 days)
+CSAT 7-Day Moving Average = 
+CALCULATE(
+    AVERAGEX(
+        DATESINPERIOD('Calendar'[Date], LASTDATE('Calendar'[Date]), -7, DAY),
+        [Avg CSAT]
+    )
+)
+
+// Year-over-year CSAT comparison
+YoY CSAT Growth = 
+[Avg CSAT] - 
+CALCULATE(
+    [Avg CSAT],
+    SAMEPERIODLASTYEAR('Calendar'[Date])
+)
+
+
+// ======================================================================
+// SECTION 6: SERVICE LEVEL AGREEMENT (SLA) METRICS
+// ======================================================================
+
+// Calls exceeding wait time threshold (e.g., > 60 seconds)
+Calls Exceeding Wait Threshold = 
+CALCULATE(
+    COUNTROWS(fact_calltime),
+    fact_calltime[waitTime] > 60
+)
+
+// SLA compliance rate (wait time <= 60 seconds)
+SLA Compliance Rate = 
+DIVIDE(
+    [Total Calls] - [Calls Exceeding Wait Threshold],
+    [Total Calls]
+)
+
+// Average speed to answer (ASA)
+Avg Speed to Answer (sec) = 
+AVERAGE(fact_calltime[waitTime])
+
+// First call resolution rate (FCR)
+First Call Resolution Rate = 
+DIVIDE(
+    CALCULATE(COUNTROWS(fact_calltime), fact_calltime[isSolved] = 1),
+    [Total Calls]
+)
+
+// Calls abandoned (if waitTime is extremely high, assume abandoned)
+Abandoned Calls = 
+CALCULATE(
+    COUNTROWS(fact_calltime),
+    fact_calltime[waitTime] > 300
+)
+
+// Abandonment rate
+Abandonment Rate = 
+DIVIDE(
+    [Abandoned Calls],
+    [Total Calls]
+)
+
+
+// ======================================================================
+// SECTION 7: BUSINESS LINE SEGMENTATION
+// ======================================================================
+
+// Calls by business line (use in matrix/table)
+Calls by Line = 
+SUMMARIZE(
+    fact_calltime,
+    fact_calltime[line],
+    "Total Calls", COUNTROWS(fact_calltime),
+    "Avg Wait", AVERAGE(fact_calltime[waitTime]),
+    "Resolution %", [Resolution Rate],
+    "Avg CSAT", [Avg CSAT]
+)
+
+// Best performing line by CSAT (dynamic)
+Best Business Line = 
+TOPN(1, VALUES(fact_calltime[line]), [Avg CSAT], DESC)
+
+// Worst performing line by resolution rate
+Worst Line by Resolution = 
+TOPN(1, VALUES(fact_calltime[line]), [Resolution Rate], ASC)
+
+
+// ======================================================================
+// SECTION 8: DAILY OPERATIONAL METRICS (from aggregated table)
+// ======================================================================
+
+// Daily average calls
+Daily Avg Calls = 
+AVERAGEX(
+    VALUES(agg_daily_productivity[metricDate]),
+    SUM(agg_daily_productivity[totalCalls])
+)
+
+// Daily average resolution rate
+Daily Avg Resolution Rate = 
+AVERAGEX(
+    VALUES(agg_daily_productivity[metricDate]),
+    SUM(agg_daily_productivity[resolutionRate])
+)
+
+// Busiest day (highest call volume)
+Busiest Day = 
+TOPN(1, VALUES(agg_daily_productivity[metricDate]), SUM(agg_daily_productivity[totalCalls]), DESC)
+
+// Best day by CSAT score
+Best Day by CSAT = 
+TOPN(1, VALUES(agg_daily_productivity[metricDate]), SUM(agg_daily_productivity[avgCSAT]), DESC)
+
+
+// ======================================================================
+// SECTION 9: FILTERED & CONDITIONAL MEASURES
+// ======================================================================
+
+// CSAT distribution (count by score)
+CSAT Distribution = 
+CALCULATE(
+    COUNTROWS(fact_csat),
+    fact_csat[csat_score] = SELECTEDVALUE('CSAT_Scores'[Score])
+)
+
+// CSAT percentage (promoters: 4-5, detractors: 1-2)
+Promoter Percentage = 
+DIVIDE(
+    CALCULATE(COUNTROWS(fact_csat), fact_csat[csat_score] >= 4),
+    COUNTROWS(fact_csat)
+)
+
+Detractor Percentage = 
+DIVIDE(
+    CALCULATE(COUNTROWS(fact_csat), fact_csat[csat_score] <= 2),
+    COUNTROWS(fact_csat)
+)
+
+// Net Promoter Score (NPS) proxy
+NPS Proxy = [Promoter Percentage] - [Detractor Percentage]
+
+// High-performing agents (resolution > 90%)
+High Performing Agents = 
+CALCULATE(
+    COUNTROWS(dim_employee),
+    [Resolution Rate] > 0.9,
+    dim_employee[activeFlag] = 1
+)
+
+// At-risk agents (low CSAT < 3)
+AtRiskAgents = 
+CALCULATE(
+    COUNTROWS(dim_employee),
+    [Avg CSAT] < 3,
+    dim_employee[activeFlag] = 1
+)
+
+
+// ======================================================================
+// SECTION 10: WHAT-IF ANALYSIS (PARAMETERS)
+// ======================================================================
+
+// Assuming you create a What-If parameter called 'Wait Threshold'
+Calls Above Threshold = 
+CALCULATE(
+    COUNTROWS(fact_calltime),
+    fact_calltime[waitTime] > [Wait Threshold Value]
+)
+
+// CSAT target comparison (assuming target = 4.5)
+CSAT vs Target = 
+[Avg CSAT] - 4.5
+
+// Resolution target comparison (assuming target = 85%)
+Resolution vs Target = 
+[Resolution Rate] - 0.85
